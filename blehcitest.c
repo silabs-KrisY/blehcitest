@@ -6,7 +6,7 @@
  * to use RF test modes on an EFR32 device running RCP (HCI) firmware.
  *******************************************************************************
  * # License
- * <b>Copyright 2024 Silicon Laboratories Inc. www.silabs.com</b>
+ * <b>Copyright 2026 Silicon Laboratories Inc. www.silabs.com</b>
  *******************************************************************************
  *
  * SPDX-License-Identifier: Zlib
@@ -88,7 +88,7 @@ static struct option long_options[] = {
 		};
 
 #define VERSION_MAJ	0u
-#define VERSION_MIN	1u
+#define VERSION_MIN	2u
 
 #define TRUE   1u
 #define FALSE  0u
@@ -217,7 +217,7 @@ void exit_with_results()
 	if (test_end_rp.status == 0) {
 		// print Results.
 		if (app_state == dtm_tx_begin) {
-			printf("Test completed successfully. Number of packets transmitted = %d\r\n", test_end_rp.num_pkts);
+			printf("Test completed successfully.\r\n");
 		} else {
 			printf("Test completed successfully. Number of packets received = %d\r\n", test_end_rp.num_pkts);
 		}
@@ -270,8 +270,8 @@ int main(int argc, char *argv[])
 			power_level = atoi(optarg);
 			if (power_level>20)
 			{
-			printf("Error in power level: max value 20 dBm\n");
-			exit(EXIT_FAILURE);
+			  printf("Error in power level: max value 20 dBm\n");
+			  exit(EXIT_FAILURE);
 			}
 			break;
 
@@ -279,8 +279,8 @@ int main(int argc, char *argv[])
 			channel = atoi(optarg);
 			if (channel>39)
 			{
-			printf("Error in channel: max value 39\n");
-			exit(EXIT_FAILURE);
+			  printf("Error in channel: max value 39\n");
+			  exit(EXIT_FAILURE);
 			}
 			break;
 
