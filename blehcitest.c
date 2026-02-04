@@ -88,7 +88,7 @@ static struct option long_options[] = {
 		};
 
 #define VERSION_MAJ	0u
-#define VERSION_MIN	2u
+#define VERSION_MIN	3u
 
 #define TRUE   1u
 #define FALSE  0u
@@ -110,6 +110,16 @@ static struct option long_options[] = {
 // Custom Silabs vendor specific commands (AN1328)
 #define HCI_VS_SiliconLabs_Set_Min_Max_TX_Power_OCF 0x14
 #define HCI_VS_SiliconLabs_Read_Current_TX_Power_Configuration_OCF 0x17
+#define HCI_VS_SiliconLabs_Get_Counters_OCF 0x12
+
+// Define for return parameters for HCI_VS_SiliconLabs_Get_Counters
+typedef struct {
+	uint8_t status;
+	uint16_t tx_packets;
+	uint16_t rx_packets;
+	uint16_t crc_errors;
+	uint16_t failures;
+} __attribute__ ((packed)) vs_SiliconLabs_Get_Counters_cp;
 
 
 // Defines for extended HCI test commands in the Bluetooth Core spec V5.2
@@ -203,8 +213,10 @@ void exit_with_results()
 {
 	// end the test and report packet count
 	int ret;
+	uint8_t reset;
 
 	le_test_end_rp test_end_rp;
+	vs_SiliconLabs_Get_Counters_cp get_counters_cp;
 	struct hci_request le_test_end_rq = ble_hci_ctl_request(OCF_LE_TEST_END, NULL, 0, &test_end_rp, sizeof(test_end_rp));
 
 	ret = hci_send_req(hci_device, &le_test_end_rq, 1000);
@@ -217,9 +229,28 @@ void exit_with_results()
 	if (test_end_rp.status == 0) {
 		// print Results.
 		if (app_state == dtm_tx_begin) {
-			printf("Test completed successfully.\r\n");
+			// Here we will use the vendor specific command to read the tx counters
+			memset(&get_counters_cp, 0, sizeof(get_counters_cp));
+			reset = 0;
+			struct hci_request read_counters_rq = ble_hci_vs_request(HCI_VS_SiliconLabs_Get_Counters_OCF, &reset, 
+												sizeof(reset), &get_counters_cp, sizeof(get_counters_cp));
+
+			ret = hci_send_req(hci_device, &read_counters_rq, 1000);
+			if ( ret < 0 ) {
+				perror("Failed to read counters");
+				hci_close_dev(hci_device);
+				exit(-1);
+			}
+			if (get_counters_cp.status != 0) {
+				printf("HCI_VS_SiliconLabs_Get_Counters hci req status = 0x%x\r\n", get_counters_cp.status);
+				hci_close_dev(hci_device);
+				exit(-1);
+			}
+			printf("Test completed successfully. Number of packets transmitted = %d\r\n", 
+					get_counters_cp.tx_packets);
 		} else {
-			printf("Test completed successfully. Number of packets received = %d\r\n", test_end_rp.num_pkts);
+			printf("Test completed successfully. Number of packets received = %d\r\n", 
+					test_end_rp.num_pkts);
 		}
 	} else {
 		printf("OCF_LE_TEST_END error status=0x%x\r\n", test_end_rp.status);
@@ -391,8 +422,29 @@ void start_tx(uint8_t channel, uint8_t len, uint8_t packet_type, uint8_t phy, in
 	// Set LE transmitter test parameters using the v4 tx test command
 	uint8_t status;
 	int ret;
+	uint8_t reset;
 
+	vs_SiliconLabs_Get_Counters_cp get_counters_cp;
 	le_transmitter_test_v4_cp tx_test_params_cp;
+
+	// first use vendor specific command to reset counters
+	memset(&get_counters_cp, 0, sizeof(get_counters_cp));
+	reset = 1;
+	struct hci_request reset_counters_rq = ble_hci_vs_request(HCI_VS_SiliconLabs_Get_Counters_OCF, &reset, 
+										sizeof(reset), &get_counters_cp, sizeof(get_counters_cp));
+
+	ret = hci_send_req(hci_device, &reset_counters_rq, 1000);
+	if ( ret < 0 ) {
+		perror("Failed to get counters");
+		hci_close_dev(hci_device);
+		exit(-1);
+	}
+	if (get_counters_cp.status != 0) {
+		printf("HCI_VS_SiliconLabs_Get_Counters hci req status = 0x%x\r\n", get_counters_cp.status);
+		hci_close_dev(hci_device);
+		exit(-1);
+	}
+	
 	memset(&tx_test_params_cp, 0, sizeof(tx_test_params_cp));
 	tx_test_params_cp.frequency 			= channel;
 	tx_test_params_cp.phy 			= phy;

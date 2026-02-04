@@ -50,7 +50,7 @@ OPTIONS
 $ sudo ./exe/blehcitest --time 10000 --packet_type 0 --power 8 --channel 1 --len 25 --hci_port 1 --phy 1
 Opening hci port 1
 Outputting modulation type 0x00 for 10000 ms at 2404 MHz at 8 dBm, phy=0x01
-Test completed successfully. 
+Test completed successfully. Number of packets transmitted = 16013
 ```
 
 2. Receive DTM (direct test mode) packets for 10 seconds on 2404 MHz on hci1 using the 1Mbps PHY. Note that the printout below shows an example of 100% packet reception rate when running example 1 (TX with PRBS9 DTM length=25) on a separate device.
