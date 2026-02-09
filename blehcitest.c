@@ -71,6 +71,7 @@
 #define LONG_OPT_RX 6
 #define LONG_OPT_PHY 7
 #define LONG_OPT_PORT 8
+#define LONG_OPT_SCAN 9
 #define LONG_OPT_HELP 'h'
 
 static struct option long_options[] = {
@@ -83,6 +84,7 @@ static struct option long_options[] = {
 		{"rx",         no_argument,       0,  LONG_OPT_RX },
 		{"phy",        required_argument, 0,  LONG_OPT_PHY },
 		{"hci_port",   required_argument, 0,  LONG_OPT_PORT },
+		{"adv_scan", 	no_argument, 	0, 	  LONG_OPT_SCAN},
 		{"help",   	   no_argument, 0,  LONG_OPT_HELP },
 		{0,           0,                 0,  0  }
 		};
@@ -169,13 +171,15 @@ static int hci_device;
 /* application state machine */
 static enum app_states {
   dtm_rx_begin,
-  dtm_tx_begin
-} app_state =  dtm_tx_begin; //default to TX
+  dtm_tx_begin,
+  adv_scan_begin
+} app_state =  dtm_tx_begin; //default to DTM TX
 
 /* Prototypes */
 void set_power(int16_t power_ddbm);
 void start_tx(uint8_t channel, uint8_t len, uint8_t packet_type, uint8_t phy, int8_t power);
 void start_rx(uint8_t channel, uint8_t phy);
+void start_adv_scan(void);
 void get_power_config(void);
 void exit_with_results(void);
 
@@ -217,6 +221,7 @@ void exit_with_results()
 
 	le_test_end_rp test_end_rp;
 	vs_SiliconLabs_Get_Counters_cp get_counters_cp;
+	
 	struct hci_request le_test_end_rq = ble_hci_ctl_request(OCF_LE_TEST_END, NULL, 0, &test_end_rp, sizeof(test_end_rp));
 
 	ret = hci_send_req(hci_device, &le_test_end_rq, 1000);
@@ -274,6 +279,9 @@ int main(int argc, char *argv[])
 	int option_index = 0;
 	char *temp;
 	int hci_port = -1;
+	struct timespec start_time, current_time, elapsed_time;
+	uint8_t buf[HCI_MAX_EVENT_SIZE];
+	double elapsed_time_usec;
 
 	// Process command line options.
 	while ((opt = getopt_long(argc, argv, OPTSTRING, long_options, &option_index)) != -1) {
@@ -290,6 +298,7 @@ int main(int argc, char *argv[])
 
 		case LONG_OPT_TIME:
 			duration_usec = atoi(optarg)*1000;
+			clock_gettime(CLOCK_MONOTONIC, &start_time); // get time stamp for later use
 			break;
 
 		case LONG_OPT_PACKET_TYPE:
@@ -337,6 +346,10 @@ int main(int argc, char *argv[])
 		case LONG_OPT_PORT:
 			/* Select HCI port */
 			hci_port = atoi(optarg);
+			break;
+
+		case LONG_OPT_SCAN:
+			app_state = adv_scan_begin;
 			break;
 
 		default:
@@ -399,23 +412,68 @@ int main(int argc, char *argv[])
 			start_rx(channel, selected_phy);
 			break;
 		
+		case adv_scan_begin:
+			printf("Adv scan enabled\r\n");
+			start_adv_scan();
+			break;
+		
 		default:
 			break;
 	}	
 
-	// pause
-	if (duration_usec != 0) {
-	usleep(duration_usec);	/* sleep during test */
-	} else {
-		// Infinite mode
-		printf("Infinite mode. Press control-c to exit...\r\n");
-		while(1) {
-		// wait here for control-c, sleeping periodically to save host CPU cycles
-		usleep(1000);
+	if ((app_state == dtm_tx_begin) || (app_state == dtm_rx_begin)) {
+		if (duration_usec != 0) {
+			usleep(duration_usec);	/* sleep during test */
+		} else {
+			// Infinite mode
+			printf("Infinite mode. Press control-c to exit...\r\n");
+			while(1) {
+				// wait here for control-c, sleeping periodically to save host CPU cycles
+				usleep(1000);
+			}
+			exit_with_results();
 		}
+	} else if (app_state == adv_scan_begin) { 
+		do {
+
+			evt_le_meta_event * meta_event;
+			le_advertising_info * info;
+			int len;
+			len = read(hci_device, buf, sizeof(buf));
+			if ( len >= HCI_EVENT_HDR_SIZE )
+			{
+				meta_event = (evt_le_meta_event*)(buf+HCI_EVENT_HDR_SIZE+1);
+				if ( meta_event->subevent == EVT_LE_ADVERTISING_REPORT )
+				{
+					// print results
+					uint8_t reports_count = meta_event->data[0];
+					void * offset = meta_event->data + 1;
+					while ( reports_count-- )
+					{
+						info = (le_advertising_info *)offset;
+						char addr[18];
+						ba2str( &(info->bdaddr), addr);
+						printf("%s %d", addr, (int8_t)info->data[info->length]);
+						for (int i = 0; i < info->length; i++)
+							printf(" %02X", (unsigned char)info->data[i]);
+						printf("\n");
+						offset = info->data + info->length + 2;
+					}
+				}
+			}
+			clock_gettime(CLOCK_MONOTONIC, &current_time); // get current time stamp
+			elapsed_time.tv_sec = current_time.tv_sec - start_time.tv_sec;
+			elapsed_time.tv_nsec = current_time.tv_nsec - start_time.tv_nsec;
+			if (elapsed_time.tv_nsec < 0) {
+				--elapsed_time.tv_sec;
+				elapsed_time.tv_nsec += 1000000000L;
+			}
+			elapsed_time_usec = (elapsed_time.tv_sec * 1000000) + (elapsed_time.tv_nsec / 1000);
+			printf("elapsed_time.tv_sec: %ld, %lf\r\n", elapsed_time.tv_sec, elapsed_time_usec);
+		} while ((elapsed_time_usec < duration_usec) || (duration_usec == 0) );
 	}
 
-	exit_with_results();
+	
 }
 
 void start_tx(uint8_t channel, uint8_t len, uint8_t packet_type, uint8_t phy, int8_t power) {
@@ -492,6 +550,77 @@ void start_rx(uint8_t channel, uint8_t phy) {
 		hci_close_dev(hci_device);
 		exit(-1);
 	}
+}
+
+void start_adv_scan(void) {
+
+	int ret, status;
+	le_set_scan_parameters_cp scan_params_cp;
+
+	printf("Scanning for BLE advertising...\r\n");
+	// Set BLE scan parameters.
+	memset(&scan_params_cp, 0, sizeof(scan_params_cp));
+	scan_params_cp.type 			= 0x00;
+	scan_params_cp.interval 		= htobs(0x0010);
+	scan_params_cp.window 			= htobs(0x0010);
+	scan_params_cp.own_bdaddr_type 	= 0x00; // Public Device Address (default).
+	scan_params_cp.filter 			= 0x00; // Accept all.
+
+	struct hci_request scan_params_rq = ble_hci_ctl_request(OCF_LE_SET_SCAN_PARAMETERS, &scan_params_cp, 
+		LE_SET_SCAN_PARAMETERS_CP_SIZE, &status, sizeof(status));
+
+	ret = hci_send_req(hci_device, &scan_params_rq, 1000);
+	if ( ret < 0 ) {
+		hci_close_dev(hci_device);
+		perror("Failed to set scan parameters data.");
+		exit(-1);
+	}
+
+	// Set BLE events report mask.
+
+	le_set_event_mask_cp event_mask_cp;
+	memset(&event_mask_cp, 0, sizeof(le_set_event_mask_cp));
+	int i = 0;
+	for ( i = 0 ; i < 8 ; i++ ) event_mask_cp.mask[i] = 0xFF;
+
+	struct hci_request set_mask_rq = ble_hci_ctl_request(OCF_LE_SET_EVENT_MASK, &event_mask_cp, 
+		LE_SET_EVENT_MASK_CP_SIZE, &status, sizeof(status));
+	ret = hci_send_req(hci_device, &set_mask_rq, 1000);
+	if ( ret < 0 ) {
+		hci_close_dev(hci_device);
+		perror("Failed to set event mask.");
+		exit(-1);
+	}
+
+	// Enable adv scanning.
+
+	le_set_scan_enable_cp scan_cp;
+	memset(&scan_cp, 0, sizeof(scan_cp));
+	scan_cp.enable 		= 0x01;	// Enable flag.
+	scan_cp.filter_dup 	= 0x00; // Filtering disabled.
+
+	struct hci_request enable_adv_rq = ble_hci_ctl_request(OCF_LE_SET_SCAN_ENABLE, &scan_cp, 
+		LE_SET_SCAN_ENABLE_CP_SIZE, &status, sizeof(status) );
+
+	ret = hci_send_req(hci_device, &enable_adv_rq, 1000);
+	if ( ret < 0 ) {
+		hci_close_dev(hci_device);
+		perror("Failed to enable scan.");
+		exit(-1);
+	}
+
+	// Get Results.
+
+	struct hci_filter nf;
+	hci_filter_clear(&nf);
+	hci_filter_set_ptype(HCI_EVENT_PKT, &nf);
+	hci_filter_set_event(EVT_LE_META_EVENT, &nf);
+	if ( setsockopt(hci_device, SOL_HCI, HCI_FILTER, &nf, sizeof(nf)) < 0 ) {
+		hci_close_dev(hci_device);
+		perror("Could not set socket options\n");
+		exit(-1);
+	}
+
 }
 
 void set_power(int16_t power_ddbm) {
