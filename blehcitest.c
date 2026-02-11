@@ -453,7 +453,7 @@ int main(int argc, char *argv[])
 						info = (le_advertising_info *)offset;
 						char addr[18];
 						ba2str( &(info->bdaddr), addr);
-						printf("%s %d", addr, (int8_t)info->data[info->length]);
+						printf("%s RSSI: %d DATA: ", addr, (int8_t)info->data[info->length]);
 						for (int i = 0; i < info->length; i++)
 							printf(" %02X", (unsigned char)info->data[i]);
 						printf("\n");
@@ -469,7 +469,6 @@ int main(int argc, char *argv[])
 				elapsed_time.tv_nsec += 1000000000L;
 			}
 			elapsed_time_usec = (elapsed_time.tv_sec * 1000000) + (elapsed_time.tv_nsec / 1000);
-			printf("elapsed_time.tv_sec: %ld, %lf\r\n", elapsed_time.tv_sec, elapsed_time_usec);
 		} while ((elapsed_time_usec < duration_usec) || (duration_usec == 0) );
 	}
 
