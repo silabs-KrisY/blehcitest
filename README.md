@@ -44,6 +44,7 @@ OPTIONS
   --hci_port <hci port num>    Number of the DUT's HCI port (0=hci0, 1=hci1, 2=hci2, etc.)
   --adv <name>                Advertise with Complete Local Name set to <name>
   --advscan                   Scan for advertisements and print MAC, RSSI, and AD types
+  --advscan_filter <MAC>      Only print scan results from the supplied MAC address
 ```
 ## Examples
 
@@ -76,5 +77,13 @@ Infinite mode. Press control-c to exit...
 $ sudo ./exe/blehcitest --advscan --time 10000 --hci_port 1
 Opening hci port 1
 Scanning for advertisements for 10000 ms
+AA:BB:CC:DD:EE:FF RSSI -58 dBm AD types: Flags (0x01), Complete Local Name (0x09), Manufacturer Specific Data (0xFF) Complete Local Name: "EFR32-Test"
+```
+
+5. Scan for advertisements from only one remote MAC address.
+```
+$ sudo ./exe/blehcitest --advscan_filter AA:BB:CC:DD:EE:FF --time 10000 --hci_port 1
+Opening hci port 1
+Scanning for advertisements for 10000 ms, filter=AA:BB:CC:DD:EE:FF
 AA:BB:CC:DD:EE:FF RSSI -58 dBm AD types: Flags (0x01), Complete Local Name (0x09), Manufacturer Specific Data (0xFF) Complete Local Name: "EFR32-Test"
 ```

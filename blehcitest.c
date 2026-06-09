@@ -69,6 +69,7 @@
 "  --hci_port <hci port num>    Number of the DUT's HCI port (0=hci0, 1=hci1, 2=hci2, etc.)\n"\
 "  --adv <name>                Advertise with Complete Local Name set to <name>\n"\
 "  --advscan                   Scan for advertisements and print MAC, RSSI, and AD types\n"\
+"  --advscan_filter <MAC>      Scan for advertisements, but only print scan results from the supplied MAC address\n"\
 
 #define LONG_OPT_VERSION 0
 #define LONG_OPT_TIME 1
@@ -81,6 +82,7 @@
 #define LONG_OPT_PORT 8
 #define LONG_OPT_ADV 9
 #define LONG_OPT_ADVSCAN 10
+#define LONG_OPT_ADVSCAN_FILTER 11
 #define LONG_OPT_HELP 'h'
 
 static struct option long_options[] = {
@@ -95,6 +97,7 @@ static struct option long_options[] = {
 		{"hci_port",   required_argument, 0,  LONG_OPT_PORT },
 		{"adv",        required_argument, 0,  LONG_OPT_ADV },
 		{"advscan",    no_argument,       0,  LONG_OPT_ADVSCAN },
+		{"advscan_filter", required_argument, 0,  LONG_OPT_ADVSCAN_FILTER },
 		{"help",   	   no_argument, 0,  LONG_OPT_HELP },
 		{0,           0,                 0,  0  }
 		};
@@ -249,6 +252,9 @@ static uint8_t selected_phy=DEFAULT_PHY;
 
 static int hci_device = -1;
 static char *advertising_name = NULL;
+static bdaddr_t advscan_filter_addr;
+static char advscan_filter_string[18];
+static uint8_t advscan_filter_enabled = FALSE;
 static volatile sig_atomic_t stop_requested = FALSE;
 
 /* application state machine */
@@ -271,6 +277,8 @@ void stop_advertising(void);
 void scan_advertisements(uint32_t duration_us);
 void get_power_config(void);
 void exit_with_results(void);
+int hex_nibble(char c);
+uint8_t parse_mac_address(const char *text, bdaddr_t *addr, char *canonical, size_t canonical_len);
 const char *ad_type_name(uint8_t type);
 void format_ad_type_list(const uint8_t *data, uint8_t data_len, char *out, size_t out_len);
 uint8_t extract_complete_name(const uint8_t *data, uint8_t data_len, char *out, size_t out_len);
@@ -494,6 +502,17 @@ int main(int argc, char *argv[])
 			app_state = advscan_begin;
 			break;
 
+		case LONG_OPT_ADVSCAN_FILTER:
+			if (!parse_mac_address(optarg, &advscan_filter_addr,
+					advscan_filter_string, sizeof(advscan_filter_string))) {
+				printf("Error! Invalid MAC address \"%s\". Expected format XX:XX:XX:XX:XX:XX\n",
+						optarg);
+				exit(EXIT_FAILURE);
+			}
+			advscan_filter_enabled = TRUE;
+			app_state = advscan_begin;
+			break;
+
 		default:
 			break;
 		}
@@ -575,7 +594,12 @@ int main(int argc, char *argv[])
 			return 0;
 
 		case advscan_begin:
-			printf("Scanning for advertisements for %u ms\r\n", duration_usec/1000);
+			if (advscan_filter_enabled) {
+				printf("Scanning for advertisements for %u ms, filter=%s\r\n",
+						duration_usec/1000, advscan_filter_string);
+			} else {
+				printf("Scanning for advertisements for %u ms\r\n", duration_usec/1000);
+			}
 			scan_advertisements(duration_usec);
 			close_hci();
 			return 0;
@@ -860,6 +884,65 @@ void scan_advertisements(uint32_t duration_us)
 	}
 }
 
+int hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9') {
+		return c - '0';
+	}
+	if (c >= 'A' && c <= 'F') {
+		return c - 'A' + 10;
+	}
+	if (c >= 'a' && c <= 'f') {
+		return c - 'a' + 10;
+	}
+	return -1;
+}
+
+uint8_t parse_mac_address(const char *text, bdaddr_t *addr, char *canonical, size_t canonical_len)
+{
+	static const char hex_chars[] = "0123456789ABCDEF";
+	uint8_t bytes[6];
+	size_t i;
+
+	if (text == NULL || strlen(text) != 17 || addr == NULL) {
+		return FALSE;
+	}
+	if (canonical != NULL && canonical_len < 18) {
+		return FALSE;
+	}
+
+	for (i = 0; i < sizeof(bytes); i++) {
+		int high = hex_nibble(text[i * 3]);
+		int low = hex_nibble(text[(i * 3) + 1]);
+
+		if (high < 0 || low < 0) {
+			return FALSE;
+		}
+		if (i < 5 && text[(i * 3) + 2] != ':') {
+			return FALSE;
+		}
+
+		bytes[i] = (uint8_t)((high << 4) | low);
+		if (canonical != NULL) {
+			canonical[i * 3] = hex_chars[high];
+			canonical[(i * 3) + 1] = hex_chars[low];
+			if (i < 5) {
+				canonical[(i * 3) + 2] = ':';
+			}
+		}
+	}
+
+	if (canonical != NULL) {
+		canonical[17] = '\0';
+	}
+
+	for (i = 0; i < sizeof(bytes); i++) {
+		addr->b[5 - i] = bytes[i];
+	}
+
+	return TRUE;
+}
+
 const char *ad_type_name(uint8_t type)
 {
 	switch (type) {
@@ -1086,6 +1169,11 @@ void print_advertising_reports(const uint8_t *buf, ssize_t len)
 		remaining -= data_len;
 		rssi = (int8_t)*ptr++;
 		remaining--;
+
+		if (advscan_filter_enabled
+				&& memcmp(&bdaddr, &advscan_filter_addr, sizeof(bdaddr)) != 0) {
+			continue;
+		}
 
 		ba2str(&bdaddr, addr);
 		format_ad_type_list(ad_data, data_len, ad_types, sizeof(ad_types));
