@@ -42,6 +42,8 @@ OPTIONS
   --rx                        DTM receive test. Prints number of received DTM packets.
   --phy  <PHY selection for test packets/waveforms/RX mode, 1:1Mbps, 2:2Mbps, 3:125k LR coded (S=8), 4:500k LR coded (S=2).>
   --hci_port <hci port num>    Number of the DUT's HCI port (0=hci0, 1=hci1, 2=hci2, etc.)
+  --adv <name>                Advertise with Complete Local Name set to <name>
+  --advscan                   Scan for advertisements and print MAC, RSSI, and AD types
 ```
 ## Examples
 
@@ -59,4 +61,20 @@ $ sudo ./exe/blehcitest --time 10000 --rx --phy 1 --hci_port 1
 Opening hci port 1
 DTM receive enabled, freq=2402 MHz, phy=0x01
 Test completed successfully. Number of packets received = 16005
+```
+
+3. Advertise indefinitely on hci1 with a Complete Local Name of `EFR32-Test`.
+```
+$ sudo ./exe/blehcitest --adv EFR32-Test --hci_port 1
+Opening hci port 1
+Advertising Complete Local Name "EFR32-Test" for 0 ms
+Infinite mode. Press control-c to exit...
+```
+
+4. Scan for advertisements for 10 seconds on hci1.
+```
+$ sudo ./exe/blehcitest --advscan --time 10000 --hci_port 1
+Opening hci port 1
+Scanning for advertisements for 10000 ms
+AA:BB:CC:DD:EE:FF RSSI -58 dBm AD types: Flags (0x01), Complete Local Name (0x09), Manufacturer Specific Data (0xFF)
 ```

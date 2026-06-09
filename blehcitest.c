@@ -32,10 +32,16 @@
  ******************************************************************************/
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/hci.h>
 #include <bluetooth/hci_lib.h>
@@ -61,6 +67,8 @@
 "  --rx                        DTM receive test. Prints number of received DTM packets.\n"\
 "  --phy  <PHY selection for test packets/waveforms/RX mode, 1:1Mbps, 2:2Mbps, 3:125k LR coded (S=8), 4:500k LR coded (S=2).>\n"\
 "  --hci_port <hci port num>    Number of the DUT's HCI port (0=hci0, 1=hci1, 2=hci2, etc.)\n"\
+"  --adv <name>                Advertise with Complete Local Name set to <name>\n"\
+"  --advscan                   Scan for advertisements and print MAC, RSSI, and AD types\n"\
 
 #define LONG_OPT_VERSION 0
 #define LONG_OPT_TIME 1
@@ -71,6 +79,8 @@
 #define LONG_OPT_RX 6
 #define LONG_OPT_PHY 7
 #define LONG_OPT_PORT 8
+#define LONG_OPT_ADV 9
+#define LONG_OPT_ADVSCAN 10
 #define LONG_OPT_HELP 'h'
 
 static struct option long_options[] = {
@@ -83,12 +93,14 @@ static struct option long_options[] = {
 		{"rx",         no_argument,       0,  LONG_OPT_RX },
 		{"phy",        required_argument, 0,  LONG_OPT_PHY },
 		{"hci_port",   required_argument, 0,  LONG_OPT_PORT },
+		{"adv",        required_argument, 0,  LONG_OPT_ADV },
+		{"advscan",    no_argument,       0,  LONG_OPT_ADVSCAN },
 		{"help",   	   no_argument, 0,  LONG_OPT_HELP },
 		{0,           0,                 0,  0  }
 		};
 
 #define VERSION_MAJ	0u
-#define VERSION_MIN	3u
+#define VERSION_MIN	4u
 
 #define TRUE   1u
 #define FALSE  0u
@@ -106,6 +118,39 @@ static struct option long_options[] = {
 #define DEFAULT_POWER_LEVEL		5	//5 dBm
 #define DEFAULT_PACKET_LENGTH	25
 #define CMP_LENGTH	2
+
+#define MAX_LE_ADV_DATA_LEN	31
+#define ADV_TYPE_COMPLETE_LOCAL_NAME 0x09
+#define DEFAULT_ADV_INTERVAL	0x00A0
+#define DEFAULT_ADV_CHANNEL_MAP 0x07
+#define DEFAULT_SCAN_INTERVAL	0x0010
+#define DEFAULT_SCAN_WINDOW	0x0010
+#define HCI_EVENT_BUFFER_SIZE	260
+
+#ifndef OCF_LE_SET_ADVERTISING_PARAMETERS
+#define OCF_LE_SET_ADVERTISING_PARAMETERS 0x0006
+#endif
+#ifndef OCF_LE_SET_ADVERTISING_DATA
+#define OCF_LE_SET_ADVERTISING_DATA 0x0008
+#endif
+#ifndef OCF_LE_SET_ADVERTISE_ENABLE
+#define OCF_LE_SET_ADVERTISE_ENABLE 0x000A
+#endif
+#ifndef OCF_LE_SET_SCAN_PARAMETERS
+#define OCF_LE_SET_SCAN_PARAMETERS 0x000B
+#endif
+#ifndef OCF_LE_SET_SCAN_ENABLE
+#define OCF_LE_SET_SCAN_ENABLE 0x000C
+#endif
+#ifndef EVT_LE_META_EVENT
+#define EVT_LE_META_EVENT 0x3E
+#endif
+#ifndef EVT_LE_ADVERTISING_REPORT
+#define EVT_LE_ADVERTISING_REPORT 0x02
+#endif
+#ifndef HCI_EVENT_HDR_SIZE
+#define HCI_EVENT_HDR_SIZE 2
+#endif
 
 // Custom Silabs vendor specific commands (AN1328)
 #define HCI_VS_SiliconLabs_Set_Min_Max_TX_Power_OCF 0x14
@@ -146,6 +191,44 @@ typedef struct {
 } __attribute__ ((packed)) le_transmitter_test_v4_cp;
 #define LE_TRANSMITTER_TEST_V4_CP_SIZE 8
 
+typedef struct {
+	uint16_t	min_interval;
+	uint16_t	max_interval;
+	uint8_t		adv_type;
+	uint8_t		own_bdaddr_type;
+	uint8_t		direct_bdaddr_type;
+	bdaddr_t	direct_bdaddr;
+	uint8_t		channel_map;
+	uint8_t		filter_policy;
+} __attribute__ ((packed)) app_le_set_advertising_parameters_cp;
+#define APP_LE_SET_ADVERTISING_PARAMETERS_CP_SIZE 15
+
+typedef struct {
+	uint8_t		length;
+	uint8_t		data[MAX_LE_ADV_DATA_LEN];
+} __attribute__ ((packed)) app_le_set_advertising_data_cp;
+#define APP_LE_SET_ADVERTISING_DATA_CP_SIZE 32
+
+typedef struct {
+	uint8_t		enable;
+} __attribute__ ((packed)) app_le_set_advertise_enable_cp;
+#define APP_LE_SET_ADVERTISE_ENABLE_CP_SIZE 1
+
+typedef struct {
+	uint8_t		scan_type;
+	uint16_t	interval;
+	uint16_t	window;
+	uint8_t		own_bdaddr_type;
+	uint8_t		filter_policy;
+} __attribute__ ((packed)) app_le_set_scan_parameters_cp;
+#define APP_LE_SET_SCAN_PARAMETERS_CP_SIZE 7
+
+typedef struct {
+	uint8_t		enable;
+	uint8_t		filter_dup;
+} __attribute__ ((packed)) app_le_set_scan_enable_cp;
+#define APP_LE_SET_SCAN_ENABLE_CP_SIZE 2
+
 /* The modulation type */
 static uint8_t packet_type=DEFAULT_PACKET_TYPE;
 
@@ -164,20 +247,33 @@ static uint8_t packet_length=DEFAULT_PACKET_LENGTH;
 /* phy */
 static uint8_t selected_phy=DEFAULT_PHY;
 
-static int hci_device;
+static int hci_device = -1;
+static char *advertising_name = NULL;
+static volatile sig_atomic_t stop_requested = FALSE;
 
 /* application state machine */
 static enum app_states {
   dtm_rx_begin,
-  dtm_tx_begin
+  dtm_tx_begin,
+  adv_begin,
+  advscan_begin
 } app_state =  dtm_tx_begin; //default to TX
 
 /* Prototypes */
+void close_hci(void);
+void wait_for_duration_or_signal(uint32_t duration_us);
+void send_le_status_command(uint16_t ocf, void *cparam, int clen, const char *description);
 void set_power(int16_t power_ddbm);
 void start_tx(uint8_t channel, uint8_t len, uint8_t packet_type, uint8_t phy, int8_t power);
 void start_rx(uint8_t channel, uint8_t phy);
+void start_advertising(const char *name);
+void stop_advertising(void);
+void scan_advertisements(uint32_t duration_us);
 void get_power_config(void);
 void exit_with_results(void);
+const char *ad_type_name(uint8_t type);
+void format_ad_type_list(const uint8_t *data, uint8_t data_len, char *out, size_t out_len);
+void print_advertising_reports(const uint8_t *buf, ssize_t len);
 
 
 struct hci_request ble_hci_ctl_request(uint16_t ocf, void * cparam, int clen, void * rparam, int rlen)
@@ -208,6 +304,54 @@ struct hci_request ble_hci_vs_request(uint16_t ocf, void * cparam, int clen, voi
 	return rq;
 }
 
+void close_hci(void)
+{
+	if (hci_device >= 0) {
+		hci_close_dev(hci_device);
+		hci_device = -1;
+	}
+}
+
+void send_le_status_command(uint16_t ocf, void *cparam, int clen, const char *description)
+{
+	uint8_t status = 0;
+	int ret;
+	struct hci_request rq = ble_hci_ctl_request(ocf, cparam, clen, &status, sizeof(status));
+
+	ret = hci_send_req(hci_device, &rq, 1000);
+	if (ret < 0) {
+		perror(description);
+		close_hci();
+		exit(-1);
+	}
+	if (status != 0) {
+		printf("%s hci req status = 0x%x\r\n", description, status);
+		close_hci();
+		exit(-1);
+	}
+}
+
+void wait_for_duration_or_signal(uint32_t duration_us)
+{
+	if (duration_us == 0) {
+		printf("Infinite mode. Press control-c to exit...\r\n");
+		while (!stop_requested) {
+			usleep(100000);
+		}
+		return;
+	}
+
+	while (!stop_requested && duration_us > 0) {
+		uint32_t sleep_us = duration_us > 100000 ? 100000 : duration_us;
+		if (usleep(sleep_us) == 0) {
+			duration_us -= sleep_us;
+		} else if (errno != EINTR) {
+			perror("Sleep interrupted");
+			break;
+		}
+	}
+}
+
 // cleanup and exit the program with exit code 0
 void exit_with_results()
 {
@@ -222,7 +366,7 @@ void exit_with_results()
 	ret = hci_send_req(hci_device, &le_test_end_rq, 1000);
 	if ( ret < 0 ) {
 		perror("Failed to end the test.");
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 
@@ -238,12 +382,12 @@ void exit_with_results()
 			ret = hci_send_req(hci_device, &read_counters_rq, 1000);
 			if ( ret < 0 ) {
 				perror("Failed to read counters");
-				hci_close_dev(hci_device);
+				close_hci();
 				exit(-1);
 			}
 			if (get_counters_cp.status != 0) {
 				printf("HCI_VS_SiliconLabs_Get_Counters hci req status = 0x%x\r\n", get_counters_cp.status);
-				hci_close_dev(hci_device);
+				close_hci();
 				exit(-1);
 			}
 			printf("Test completed successfully. Number of packets transmitted = %d\r\n", 
@@ -256,7 +400,7 @@ void exit_with_results()
 		printf("OCF_LE_TEST_END error status=0x%x\r\n", test_end_rp.status);
 	}
 
-	hci_close_dev(hci_device);
+	close_hci();
 	exit( 0 );
 }
 
@@ -264,12 +408,13 @@ void exit_with_results()
 void signal_handler( int s )
 {
 	(void) s;
-	exit_with_results();
+	stop_requested = TRUE;
 }
 
 int main(int argc, char *argv[])
 {
-	int ret, status;
+	int ret;
+	uint8_t status;
 	int opt;
 	int option_index = 0;
 	char *temp;
@@ -285,7 +430,7 @@ int main(int argc, char *argv[])
 
 		case 'v':
 		case LONG_OPT_VERSION:
-			printf("%s version %d.%d\n",argv[0],VERSION_MAJ,VERSION_MIN);
+			printf("%s version %u.%u\n",argv[0],VERSION_MAJ,VERSION_MIN);
 			break;
 
 		case LONG_OPT_TIME:
@@ -339,6 +484,15 @@ int main(int argc, char *argv[])
 			hci_port = atoi(optarg);
 			break;
 
+		case LONG_OPT_ADV:
+			advertising_name = optarg;
+			app_state = adv_begin;
+			break;
+
+		case LONG_OPT_ADVSCAN:
+			app_state = advscan_begin;
+			break;
+
 		default:
 			break;
 		}
@@ -347,7 +501,7 @@ int main(int argc, char *argv[])
 	// Install a signal handler so we can exit gracefully on control-c and print results 
 	if ( signal( SIGINT, signal_handler ) == SIG_ERR )
 	{
-		hci_close_dev(hci_device);
+		close_hci();
 		perror( "Could not install signal handler\n" );
 		return 0;
 	}
@@ -355,7 +509,7 @@ int main(int argc, char *argv[])
 	// Install a signal handler so that we can exit gracefully if terminated
 	if ( signal( SIGTERM, signal_handler ) == SIG_ERR )
 	{
-		hci_close_dev(hci_device);
+		close_hci();
 		perror( "Could not install signal handler\n" );
 		exit(-1);
 	}
@@ -380,42 +534,56 @@ int main(int argc, char *argv[])
 	reset_rq.ocf = OCF_RESET;
 	reset_rq.rparam = &status;
 	reset_rq.rlen=1;
-		ret = hci_send_req(hci_device,&reset_rq,1000);
-		if (ret < 0 ) {
+	ret = hci_send_req(hci_device,&reset_rq,1000);
+	if (ret < 0 ) {
 		perror(" ERROR: Failed to reset.");
+		close_hci();
 		return 0;
-		}
+	}
+	if (status != 0) {
+		printf("OCF_RESET error status=0x%x\r\n", status);
+		close_hci();
+		exit(-1);
+	}
 
 	switch (app_state) {
 		case dtm_tx_begin:
-			printf("Outputting modulation type 0x%02X for %d ms at %d MHz at %d dBm, phy=0x%02X\n",
+			printf("Outputting modulation type 0x%02X for %u ms at %d MHz at %d dBm, phy=0x%02X\n",
 				packet_type, duration_usec/1000, 2402+(2*channel), power_level,
 				selected_phy);
 			start_tx(channel, packet_length, packet_type, selected_phy, power_level);
+			wait_for_duration_or_signal(duration_usec);
+			exit_with_results();
 			break;
 
 		case dtm_rx_begin:
 		 	printf("DTM receive enabled, freq=%d MHz, phy=0x%02X\n",2402+(2*channel), selected_phy);
 			start_rx(channel, selected_phy);
+			wait_for_duration_or_signal(duration_usec);
+			exit_with_results();
 			break;
-		
+
+		case adv_begin:
+			printf("Advertising Complete Local Name \"%s\" for %u ms\r\n",
+					advertising_name, duration_usec/1000);
+			start_advertising(advertising_name);
+			wait_for_duration_or_signal(duration_usec);
+			stop_advertising();
+			printf("Advertising stopped\r\n");
+			close_hci();
+			return 0;
+
+		case advscan_begin:
+			printf("Scanning for advertisements for %u ms\r\n", duration_usec/1000);
+			scan_advertisements(duration_usec);
+			close_hci();
+			return 0;
+
 		default:
 			break;
 	}	
 
-	// pause
-	if (duration_usec != 0) {
-	usleep(duration_usec);	/* sleep during test */
-	} else {
-		// Infinite mode
-		printf("Infinite mode. Press control-c to exit...\r\n");
-		while(1) {
-		// wait here for control-c, sleeping periodically to save host CPU cycles
-		usleep(1000);
-		}
-	}
-
-	exit_with_results();
+	return 0;
 }
 
 void start_tx(uint8_t channel, uint8_t len, uint8_t packet_type, uint8_t phy, int8_t power) {
@@ -436,12 +604,12 @@ void start_tx(uint8_t channel, uint8_t len, uint8_t packet_type, uint8_t phy, in
 	ret = hci_send_req(hci_device, &reset_counters_rq, 1000);
 	if ( ret < 0 ) {
 		perror("Failed to get counters");
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 	if (get_counters_cp.status != 0) {
 		printf("HCI_VS_SiliconLabs_Get_Counters hci req status = 0x%x\r\n", get_counters_cp.status);
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 	
@@ -458,12 +626,12 @@ void start_tx(uint8_t channel, uint8_t len, uint8_t packet_type, uint8_t phy, in
 	ret = hci_send_req(hci_device, &tx_test_rq, 1000);
 	if ( ret < 0 ) {
 		perror("Failed to set transmit test data.");
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 	if (status != 0) {
 		printf("start_tx hci req status = 0x%x\r\n",status);
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 }
@@ -484,13 +652,397 @@ void start_rx(uint8_t channel, uint8_t phy) {
 	ret = hci_send_req(hci_device, &rx_test_rq, 1000);
 	if ( ret < 0 ) {
 		perror("Failed to set transmit test data.");
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 	if (status != 0) {
 		printf("start_rx hci req status = 0x%x\r\n", status);
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
+	}
+}
+
+void start_advertising(const char *name)
+{
+	app_le_set_advertising_parameters_cp adv_params_cp;
+	app_le_set_advertising_data_cp adv_data_cp;
+	app_le_set_advertise_enable_cp adv_enable_cp;
+	size_t name_len;
+
+	if (name == NULL) {
+		printf("Missing advertising name\r\n");
+		close_hci();
+		exit(-1);
+	}
+
+	name_len = strlen(name);
+	if (name_len > (MAX_LE_ADV_DATA_LEN - 2)) {
+		printf("Advertising name too long: max %d bytes for Complete Local Name\r\n",
+				MAX_LE_ADV_DATA_LEN - 2);
+		close_hci();
+		exit(-1);
+	}
+
+	memset(&adv_enable_cp, 0, sizeof(adv_enable_cp));
+	send_le_status_command(OCF_LE_SET_ADVERTISE_ENABLE,
+			&adv_enable_cp,
+			APP_LE_SET_ADVERTISE_ENABLE_CP_SIZE,
+			"Failed to disable advertising");
+
+	memset(&adv_params_cp, 0, sizeof(adv_params_cp));
+	adv_params_cp.min_interval = htobs(DEFAULT_ADV_INTERVAL);
+	adv_params_cp.max_interval = htobs(DEFAULT_ADV_INTERVAL);
+	adv_params_cp.adv_type = 0x00; // ADV_IND, connectable undirected advertising.
+	adv_params_cp.own_bdaddr_type = 0x00;
+	adv_params_cp.direct_bdaddr_type = 0x00;
+	adv_params_cp.channel_map = DEFAULT_ADV_CHANNEL_MAP;
+	adv_params_cp.filter_policy = 0x00;
+	send_le_status_command(OCF_LE_SET_ADVERTISING_PARAMETERS,
+			&adv_params_cp,
+			APP_LE_SET_ADVERTISING_PARAMETERS_CP_SIZE,
+			"Failed to set advertising parameters");
+
+	memset(&adv_data_cp, 0, sizeof(adv_data_cp));
+	adv_data_cp.length = (uint8_t)(name_len + 2);
+	adv_data_cp.data[0] = (uint8_t)(name_len + 1);
+	adv_data_cp.data[1] = ADV_TYPE_COMPLETE_LOCAL_NAME;
+	memcpy(&adv_data_cp.data[2], name, name_len);
+	send_le_status_command(OCF_LE_SET_ADVERTISING_DATA,
+			&adv_data_cp,
+			APP_LE_SET_ADVERTISING_DATA_CP_SIZE,
+			"Failed to set advertising data");
+
+	adv_enable_cp.enable = TRUE;
+	send_le_status_command(OCF_LE_SET_ADVERTISE_ENABLE,
+			&adv_enable_cp,
+			APP_LE_SET_ADVERTISE_ENABLE_CP_SIZE,
+			"Failed to enable advertising");
+}
+
+void stop_advertising(void)
+{
+	app_le_set_advertise_enable_cp adv_enable_cp;
+
+	if (hci_device < 0) {
+		return;
+	}
+
+	memset(&adv_enable_cp, 0, sizeof(adv_enable_cp));
+	send_le_status_command(OCF_LE_SET_ADVERTISE_ENABLE,
+			&adv_enable_cp,
+			APP_LE_SET_ADVERTISE_ENABLE_CP_SIZE,
+			"Failed to disable advertising");
+}
+
+void set_scan_enable(uint8_t enable)
+{
+	app_le_set_scan_enable_cp scan_enable_cp;
+
+	memset(&scan_enable_cp, 0, sizeof(scan_enable_cp));
+	scan_enable_cp.enable = enable;
+	scan_enable_cp.filter_dup = FALSE;
+	send_le_status_command(OCF_LE_SET_SCAN_ENABLE,
+			&scan_enable_cp,
+			APP_LE_SET_SCAN_ENABLE_CP_SIZE,
+			enable ? "Failed to enable scanning" : "Failed to disable scanning");
+}
+
+uint64_t monotonic_ms(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
+		perror("clock_gettime");
+		close_hci();
+		exit(-1);
+	}
+
+	return ((uint64_t)ts.tv_sec * 1000u) + ((uint64_t)ts.tv_nsec / 1000000u);
+}
+
+void scan_advertisements(uint32_t duration_us)
+{
+	app_le_set_scan_parameters_cp scan_params_cp;
+	struct hci_filter original_filter;
+	struct hci_filter scan_filter;
+	socklen_t original_filter_len = sizeof(original_filter);
+	uint64_t end_ms = 0;
+
+	memset(&scan_params_cp, 0, sizeof(scan_params_cp));
+	scan_params_cp.scan_type = 0x00; // Passive scanning.
+	scan_params_cp.interval = htobs(DEFAULT_SCAN_INTERVAL);
+	scan_params_cp.window = htobs(DEFAULT_SCAN_WINDOW);
+	scan_params_cp.own_bdaddr_type = 0x00;
+	scan_params_cp.filter_policy = 0x00;
+	send_le_status_command(OCF_LE_SET_SCAN_PARAMETERS,
+			&scan_params_cp,
+			APP_LE_SET_SCAN_PARAMETERS_CP_SIZE,
+			"Failed to set scan parameters");
+
+	if (getsockopt(hci_device, SOL_HCI, HCI_FILTER,
+			&original_filter, &original_filter_len) < 0) {
+		perror("Failed to get HCI filter");
+		close_hci();
+		exit(-1);
+	}
+
+	hci_filter_clear(&scan_filter);
+	hci_filter_set_ptype(HCI_EVENT_PKT, &scan_filter);
+	hci_filter_set_event(EVT_LE_META_EVENT, &scan_filter);
+	if (setsockopt(hci_device, SOL_HCI, HCI_FILTER,
+			&scan_filter, sizeof(scan_filter)) < 0) {
+		perror("Failed to set HCI filter");
+		close_hci();
+		exit(-1);
+	}
+
+	set_scan_enable(TRUE);
+	if (duration_us == 0) {
+		printf("Infinite mode. Press control-c to exit...\r\n");
+	} else {
+		end_ms = monotonic_ms() + (duration_us / 1000u);
+	}
+
+	while (!stop_requested) {
+		fd_set read_fds;
+		struct timeval timeout;
+		struct timeval *timeout_ptr = NULL;
+		int select_ret;
+		uint8_t event_buf[HCI_EVENT_BUFFER_SIZE];
+		ssize_t event_len;
+
+		if (duration_us != 0) {
+			uint64_t now_ms = monotonic_ms();
+			uint64_t remaining_ms;
+			if (now_ms >= end_ms) {
+				break;
+			}
+			remaining_ms = end_ms - now_ms;
+			if (remaining_ms > 1000u) {
+				remaining_ms = 1000u;
+			}
+			timeout.tv_sec = (time_t)(remaining_ms / 1000u);
+			timeout.tv_usec = (suseconds_t)((remaining_ms % 1000u) * 1000u);
+			timeout_ptr = &timeout;
+		}
+
+		FD_ZERO(&read_fds);
+		FD_SET(hci_device, &read_fds);
+		select_ret = select(hci_device + 1, &read_fds, NULL, NULL, timeout_ptr);
+		if (select_ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			perror("Failed while waiting for advertisements");
+			break;
+		}
+		if (select_ret == 0) {
+			continue;
+		}
+
+		event_len = read(hci_device, event_buf, sizeof(event_buf));
+		if (event_len < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			perror("Failed to read advertising report");
+			break;
+		}
+
+		print_advertising_reports(event_buf, event_len);
+	}
+
+	set_scan_enable(FALSE);
+	if (setsockopt(hci_device, SOL_HCI, HCI_FILTER,
+			&original_filter, original_filter_len) < 0) {
+		perror("Failed to restore HCI filter");
+	}
+}
+
+const char *ad_type_name(uint8_t type)
+{
+	switch (type) {
+		case 0x01: return "Flags";
+		case 0x02: return "Incomplete List of 16-bit Service UUIDs";
+		case 0x03: return "Complete List of 16-bit Service UUIDs";
+		case 0x04: return "Incomplete List of 32-bit Service UUIDs";
+		case 0x05: return "Complete List of 32-bit Service UUIDs";
+		case 0x06: return "Incomplete List of 128-bit Service UUIDs";
+		case 0x07: return "Complete List of 128-bit Service UUIDs";
+		case 0x08: return "Shortened Local Name";
+		case 0x09: return "Complete Local Name";
+		case 0x0A: return "TX Power Level";
+		case 0x0D: return "Class of Device";
+		case 0x0E: return "Simple Pairing Hash C-192";
+		case 0x0F: return "Simple Pairing Randomizer R-192";
+		case 0x10: return "Security Manager TK Value";
+		case 0x11: return "Security Manager Out of Band Flags";
+		case 0x12: return "Peripheral Connection Interval Range";
+		case 0x14: return "List of 16-bit Service Solicitation UUIDs";
+		case 0x15: return "List of 128-bit Service Solicitation UUIDs";
+		case 0x16: return "Service Data - 16-bit UUID";
+		case 0x17: return "Public Target Address";
+		case 0x18: return "Random Target Address";
+		case 0x19: return "Appearance";
+		case 0x1A: return "Advertising Interval";
+		case 0x1B: return "LE Bluetooth Device Address";
+		case 0x1C: return "LE Role";
+		case 0x1D: return "Simple Pairing Hash C-256";
+		case 0x1E: return "Simple Pairing Randomizer R-256";
+		case 0x1F: return "List of 32-bit Service Solicitation UUIDs";
+		case 0x20: return "Service Data - 32-bit UUID";
+		case 0x21: return "Service Data - 128-bit UUID";
+		case 0x22: return "LE Secure Connections Confirmation Value";
+		case 0x23: return "LE Secure Connections Random Value";
+		case 0x24: return "URI";
+		case 0x25: return "Indoor Positioning";
+		case 0x26: return "Transport Discovery Data";
+		case 0x27: return "LE Supported Features";
+		case 0x28: return "Channel Map Update Indication";
+		case 0x29: return "PB-ADV";
+		case 0x2A: return "Mesh Message";
+		case 0x2B: return "Mesh Beacon";
+		case 0x2C: return "BIGInfo";
+		case 0x2D: return "Broadcast Code";
+		case 0x2E: return "Resolvable Set Identifier";
+		case 0x2F: return "Advertising Interval - long";
+		case 0x30: return "Broadcast Name";
+		case 0x31: return "Encrypted Advertising Data";
+		case 0x32: return "Periodic Advertising Response Timing Information";
+		case 0x34: return "Electronic Shelf Label";
+		case 0xFF: return "Manufacturer Specific Data";
+		default: return "Unknown";
+	}
+}
+
+void append_to_ad_type_list(char *out, size_t out_len, size_t *used,
+		const char *separator, const char *name, uint8_t type)
+{
+	int written;
+
+	if (*used >= out_len) {
+		return;
+	}
+
+	written = snprintf(out + *used, out_len - *used,
+			"%s%s (0x%02X)", separator, name, type);
+	if (written < 0) {
+		return;
+	}
+	if ((size_t)written >= (out_len - *used)) {
+		*used = out_len - 1;
+	} else {
+		*used += (size_t)written;
+	}
+}
+
+void format_ad_type_list(const uint8_t *data, uint8_t data_len, char *out, size_t out_len)
+{
+	size_t used = 0;
+	uint8_t index = 0;
+	uint8_t first = TRUE;
+
+	if (out_len == 0) {
+		return;
+	}
+	out[0] = '\0';
+
+	while (index < data_len) {
+		uint8_t field_len = data[index++];
+		uint8_t type;
+
+		if (field_len == 0) {
+			break;
+		}
+		if ((index + field_len) > data_len) {
+			append_to_ad_type_list(out, out_len, &used,
+					first ? "" : ", ", "Malformed AD structure", 0x00);
+			first = FALSE;
+			break;
+		}
+
+		type = data[index];
+		append_to_ad_type_list(out, out_len, &used,
+				first ? "" : ", ", ad_type_name(type), type);
+		first = FALSE;
+		index = (uint8_t)(index + field_len);
+	}
+
+	if (first) {
+		snprintf(out, out_len, "none");
+	}
+}
+
+void print_advertising_reports(const uint8_t *buf, ssize_t len)
+{
+	const hci_event_hdr *event_hdr;
+	const uint8_t *ptr;
+	size_t remaining;
+	uint8_t reports;
+	uint8_t report_index;
+
+	if (len < (ssize_t)(1 + HCI_EVENT_HDR_SIZE + 2)) {
+		return;
+	}
+	if (buf[0] != HCI_EVENT_PKT) {
+		return;
+	}
+
+	event_hdr = (const hci_event_hdr *)(buf + 1);
+	if (event_hdr->evt != EVT_LE_META_EVENT) {
+		return;
+	}
+
+	remaining = (size_t)len - 1u - HCI_EVENT_HDR_SIZE;
+	if (event_hdr->plen < remaining) {
+		remaining = event_hdr->plen;
+	}
+
+	ptr = buf + 1 + HCI_EVENT_HDR_SIZE;
+	if (remaining < 2 || ptr[0] != EVT_LE_ADVERTISING_REPORT) {
+		return;
+	}
+	ptr++;
+	remaining--;
+
+	reports = *ptr++;
+	remaining--;
+
+	for (report_index = 0; report_index < reports; report_index++) {
+		bdaddr_t bdaddr;
+		char addr[18];
+		char ad_types[512];
+		uint8_t data_len;
+		const uint8_t *ad_data;
+		int8_t rssi;
+
+		if (remaining < 10) {
+			break;
+		}
+
+		ptr += 2; // Event_Type and Address_Type.
+		remaining -= 2;
+
+		memcpy(&bdaddr, ptr, sizeof(bdaddr));
+		ptr += sizeof(bdaddr);
+		remaining -= sizeof(bdaddr);
+
+		data_len = *ptr++;
+		remaining--;
+		if ((size_t)data_len + 1u > remaining) {
+			break;
+		}
+
+		ad_data = ptr;
+		ptr += data_len;
+		remaining -= data_len;
+		rssi = (int8_t)*ptr++;
+		remaining--;
+
+		ba2str(&bdaddr, addr);
+		format_ad_type_list(ad_data, data_len, ad_types, sizeof(ad_types));
+		printf("%s RSSI %d dBm AD types: %s\r\n", addr, rssi, ad_types);
+		fflush(stdout);
 	}
 }
 
@@ -513,12 +1065,12 @@ void set_power(int16_t power_ddbm) {
 	ret = hci_send_req(hci_device, &set_tx_power_rq, 1000);
 	if ( ret < 0 ) {
 		perror("Failed to set tx power");
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 	if (status != 0) {
 		printf("set_power hci req status = 0x%x\r\n", status);
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 
@@ -543,12 +1095,12 @@ void get_power_config(void) {
 	ret = hci_send_req(hci_device, &set_tx_power_rq, 1000);
 	if ( ret < 0 ) {
 		perror("Failed to set tx power");
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	}
 	if (txp_config_rp.status != 0) {
 		printf("get tx power config hci req status = %d\r\n", txp_config_rp.status);
-		hci_close_dev(hci_device);
+		close_hci();
 		exit(-1);
 	} else {
 		printf("min supported tx power = %d\r\n", txp_config_rp.min_supported_tx_power);
