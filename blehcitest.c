@@ -273,6 +273,7 @@ void get_power_config(void);
 void exit_with_results(void);
 const char *ad_type_name(uint8_t type);
 void format_ad_type_list(const uint8_t *data, uint8_t data_len, char *out, size_t out_len);
+uint8_t extract_complete_name(const uint8_t *data, uint8_t data_len, char *out, size_t out_len);
 void print_advertising_reports(const uint8_t *buf, ssize_t len);
 
 
@@ -973,6 +974,51 @@ void format_ad_type_list(const uint8_t *data, uint8_t data_len, char *out, size_
 	}
 }
 
+uint8_t extract_complete_name(const uint8_t *data, uint8_t data_len, char *out, size_t out_len)
+{
+	uint8_t index = 0;
+
+	if (out_len == 0) {
+		return FALSE;
+	}
+	out[0] = '\0';
+
+	while (index < data_len) {
+		uint8_t field_len = data[index++];
+		uint8_t type;
+		uint8_t value_len;
+
+		if (field_len == 0) {
+			break;
+		}
+		if ((index + field_len) > data_len) {
+			break;
+		}
+
+		type = data[index];
+		value_len = (uint8_t)(field_len - 1);
+		if (type == ADV_TYPE_COMPLETE_LOCAL_NAME) {
+			size_t copy_len = value_len;
+			size_t i;
+
+			if (copy_len >= out_len) {
+				copy_len = out_len - 1;
+			}
+
+			for (i = 0; i < copy_len; i++) {
+				uint8_t ch = data[index + 1 + i];
+				out[i] = (ch < 0x20 || ch == 0x7f) ? '.' : (char)ch;
+			}
+			out[copy_len] = '\0';
+			return TRUE;
+		}
+
+		index = (uint8_t)(index + field_len);
+	}
+
+	return FALSE;
+}
+
 void print_advertising_reports(const uint8_t *buf, ssize_t len)
 {
 	const hci_event_hdr *event_hdr;
@@ -1012,9 +1058,11 @@ void print_advertising_reports(const uint8_t *buf, ssize_t len)
 		bdaddr_t bdaddr;
 		char addr[18];
 		char ad_types[512];
+		char complete_name[256];
 		uint8_t data_len;
 		const uint8_t *ad_data;
 		int8_t rssi;
+		uint8_t has_complete_name;
 
 		if (remaining < 10) {
 			break;
@@ -1041,7 +1089,14 @@ void print_advertising_reports(const uint8_t *buf, ssize_t len)
 
 		ba2str(&bdaddr, addr);
 		format_ad_type_list(ad_data, data_len, ad_types, sizeof(ad_types));
-		printf("%s RSSI %d dBm AD types: %s\r\n", addr, rssi, ad_types);
+		has_complete_name = extract_complete_name(ad_data, data_len,
+				complete_name, sizeof(complete_name));
+		if (has_complete_name) {
+			printf("%s RSSI %d dBm AD types: %s Complete Local Name: \"%s\"\r\n",
+					addr, rssi, ad_types, complete_name);
+		} else {
+			printf("%s RSSI %d dBm AD types: %s\r\n", addr, rssi, ad_types);
+		}
 		fflush(stdout);
 	}
 }

@@ -76,5 +76,5 @@ Infinite mode. Press control-c to exit...
 $ sudo ./exe/blehcitest --advscan --time 10000 --hci_port 1
 Opening hci port 1
 Scanning for advertisements for 10000 ms
-AA:BB:CC:DD:EE:FF RSSI -58 dBm AD types: Flags (0x01), Complete Local Name (0x09), Manufacturer Specific Data (0xFF)
+AA:BB:CC:DD:EE:FF RSSI -58 dBm AD types: Flags (0x01), Complete Local Name (0x09), Manufacturer Specific Data (0xFF) Complete Local Name: "EFR32-Test"
 ```
